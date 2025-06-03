@@ -1,0 +1,12 @@
+# Ignorar archivos de configuración que contengan credenciales
+config.py
+.env
+*.env
+*.log
+# Ignorar archivos de compilación o temporales
+*.pyc
+__pycache__/
+
+# Ignorar el entorno virtual
+venv/
+basura/

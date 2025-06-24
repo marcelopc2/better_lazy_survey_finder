@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(
     layout="wide",
-    page_title="DATA SURVEY FINDER RELOADED",
+    page_title="SURVEY DATA FINDER RELOADED",
     page_icon="🗳️"
 )
 
@@ -20,6 +20,7 @@ HEADERS = {
     "Authorization": f"Bearer {API_TOKEN}",
     "Content-Type": "application/json"
 }
+debug_mode = False
 
 def clean_string(input_string: str) -> str:
     cleaned = input_string.strip().lower()
@@ -65,6 +66,24 @@ def get_surveys(course_id, session):
         return []
     surveys = [q for q in quizzes if q.get("quiz_type") in ("survey", "graded_survey")]
     return surveys
+
+def convertir_course_code(nombre):
+    # Buscar "Curso n"
+    curso_match = re.search(r'Curso\s+(\d+)', nombre)
+    curso = f"c{curso_match.group(1)}" if curso_match else ""
+    
+    # Buscar "Sección n"
+    seccion_match = re.search(r'Sección\s+(\d+)', nombre)
+    seccion = f"v{seccion_match.group(1)}" if seccion_match else ""
+    
+    # Buscar "(aaaa)"
+    anio_match = re.search(r'\((\d{4})\)', nombre)
+    anio = anio_match.group(1) if anio_match else ""
+    
+    # Armar el string final
+    partes = [curso, anio, seccion]
+    # Filtrar partes vacías y unir con guión
+    return "-".join([p for p in partes if p])
 
 @st.cache_data(show_spinner=False)
 def get_course_name(course_id):
@@ -133,17 +152,19 @@ def generar_reportes_en_paralelo(encuestas, show_progress=True):
     errores = []
     total = len(encuestas)
     progress_bar = st.progress(0) if show_progress else None
+    # Genera un mapeo de indice para cada encuesta
+    idx_map = {id(e): i for i, e in enumerate(encuestas)}
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_encuesta = {
-            executor.submit(generate_report, e['course_id'], e['id'], e['title']): e
-            for e in encuestas
+            executor.submit(generate_report, e['course_id'], e['id'], e['title']): (e, i)
+            for i, e in enumerate(encuestas)
         }
         for idx, future in enumerate(as_completed(future_to_encuesta)):
-            encuesta = future_to_encuesta[future]
+            encuesta, ingreso_idx = future_to_encuesta[future]
             try:
                 df, err = future.result()
                 if df is not None:
-                    resultados.append(df)
+                    resultados.append((ingreso_idx, df))
                 if err:
                     errores.append(err)
             except Exception as exc:
@@ -152,7 +173,9 @@ def generar_reportes_en_paralelo(encuestas, show_progress=True):
                 progress_bar.progress((idx + 1) / total)
     if show_progress and progress_bar:
         progress_bar.empty()
-    return resultados, errores
+    # Ordena los resultados por el índice original de ingreso
+    resultados_ordenados = [df for idx, df in sorted(resultados, key=lambda x: x[0])]
+    return resultados_ordenados, errores
 
 def get_students_count(course_id, session):
     """Cuenta estudiantes activos inscritos en el curso."""
@@ -205,10 +228,46 @@ def order_resultados(resultados, ids):
             return 9999  # Al final si no existe
     return sorted(resultados, key=get_index)
 
+
+@st.cache_data(show_spinner=False)
+def get_course_info(course_id):
+    # Devuelve un dict con info básica del curso + nombre de la subcuenta
+    url_course = f"{BASE_URL}/courses/{course_id}"
+    try:
+        resp = requests.get(url_course, headers=HEADERS)
+        if resp.status_code == 200:
+            data = resp.json()
+            account_id = data.get("account_id")
+            course_code = data.get("course_code", "")
+            # Obtener nombre de subcuenta
+            if account_id:
+                url_account = f"{BASE_URL}/accounts/{account_id}"
+                resp_acc = requests.get(url_account, headers=HEADERS)
+                if resp_acc.status_code == 200:
+                    acc_name = resp_acc.json().get("name", "")
+                else:
+                    acc_name = ""
+            else:
+                acc_name = ""
+            return {
+                "account_id": account_id,
+                "subaccount_name": acc_name,
+                "course_code": course_code
+            }
+    except Exception:
+        pass
+    return {
+        "account_id": None,
+        "subaccount_name": "",
+        "course_code": ""
+    }
+
 # -------- UI PRINCIPAL --------
 
-st.title("DATA SURVEY FINDER RELOADED 🗳️")
-st.write("Ingresa los IDs de los cursos separados por coma, espacio o salto de línea:")
+if debug_mode:
+    st.warning("MODO DEBUG")
+st.title("SURVEY DATA FINDER RELOADED 🗳️")
+st.write("Ingresa los IDs de los cursos separados por coma, espacio o enter:")
 
 input_ids = st.text_area("IDs de cursos", height=100, placeholder="12345, 67890\n11223")
 
@@ -300,12 +359,14 @@ if st.session_state.surveys_data and st.session_state.surveys_data["all"]:
                 resumen_por_curso[part["Curso_ID"]].append(part)
 
         # Mostrar los cursos en el orden ingresado, con nombre real
+        count = 1
         for curso in ids:
             if resumen_por_curso[curso]:
-                st.markdown(f"**{course_names.get(curso, f'Curso {curso}')}:**")
+                st.markdown(f"**({count}) {course_names.get(curso, f'Curso {curso}')}:**")
                 df = pd.DataFrame(resumen_por_curso[curso]).drop(columns=["Curso_ID"])
                 df.reset_index(drop=True, inplace=True)
                 st.dataframe(df, use_container_width=True, hide_index=True)
+                count += 1
 
         if st.button("Generar reporte general"):
             with st.spinner("Generando reportes de encuestas..."):
@@ -320,32 +381,67 @@ if st.session_state.surveys_data and st.session_state.surveys_data["all"]:
                         resultados_map[k] = df
 
                 output = BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    startrow = 0
-                    # Vamos por todas las seleccionadas, en el mismo orden y cantidad seleccionada
-                    for idx, s in enumerate(seleccionadas):
-                        curso = str(s["course_id"])
-                        encuesta = str(s["title"])
-                        curso_name = course_names.get(curso, f"Curso {curso}")
+                if resultados:
+                    # 1. Junta todos los ids de curso que aparecen en los resultados
+                    course_ids_usados = []
+                    for df in resultados:
+                        if 'Curso_ID' in df.columns and not df.empty:
+                            course_ids_usados.append(str(df['Curso_ID'].iloc[0]))
+                    course_ids_usados = list(set(course_ids_usados))
+
+                    # 2. Carga la info de cada curso (subcuenta y code)
+                    curso_info_map = {cid: get_course_info(cid) for cid in course_ids_usados}
+
+                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                        startrow = 0
                         sheet = 'Reportes'
-                        if idx == 0:
-                            writer.sheets[sheet] = writer.book.add_worksheet(sheet)
-                        ws = writer.sheets[sheet]
+                        # Encuentra el primer DataFrame no vacío
+                        idx_header = None
+                        for i, df in enumerate(resultados):
+                            if not df.empty:
+                                idx_header = i
+                                break
 
-                        ws.write(startrow, 0, f"Encuesta: {encuesta} | Curso: {curso_name}")
-                        startrow += 1
-
-                        key = (curso, encuesta)
-                        df = resultados_map.get(key)
-                        if df is not None and not df.empty:
-                            df.to_excel(writer, index=False, startrow=startrow, sheet_name=sheet, header=True)
-                            startrow += len(df) + 2
+                        if idx_header is None:
+                            st.error("No hay datos para exportar. Todas las tablas están vacías.")
                         else:
-                            ws.write(startrow, 0, "Sin datos para esta encuesta.")
-                            startrow += 3  # Deja un espacio
-                st.session_state.report_excel = output.getvalue()
-                st.session_state.report_ready = True
-                st.session_state.report_errors = errores
+                            for idx, df in enumerate(resultados):
+                                if df.empty:
+                                    st.warning(f"La encuesta {idx+1} está vacía y será ignorada en el Excel.")
+                                    continue
+                                # Agrega info extra solo si no está vacío
+                                if 'Curso_ID' in df.columns and not df.empty:
+                                    cid = str(df['Curso_ID'].iloc[0])
+                                    info = curso_info_map.get(cid, {"subaccount_name": "", "course_code": ""})
+                                    df["Diplomado/Magister"] = info["subaccount_name"]
+                                    df["Course Code"] = convertir_course_code(info["course_code"])
+
+                                # Si debug_mode está activo, agrega una fila separadora
+                                if debug_mode:
+                                    if idx == 0 and idx != idx_header:
+                                        pass
+                                    curso_name = (
+                                        str(df['Curso_ID'].iloc[0]) if ('Curso_ID' in df.columns and not df.empty) else f"Curso {idx+1}"
+                                    )
+                                    label = f"===== {curso_name} ====="
+                                    worksheet = writer.sheets[sheet] if sheet in writer.sheets else writer.book.add_worksheet(sheet)
+                                    worksheet.write(startrow, 0, label)
+                                    startrow += 1
+
+                                # Solo el primer no-vacío lleva header
+                                if idx == idx_header:
+                                    df.to_excel(writer, index=False, sheet_name=sheet, startrow=startrow)
+                                    startrow += len(df) + 1
+                                elif not df.empty:
+                                    df.to_excel(writer, index=False, header=False, sheet_name=sheet, startrow=startrow)
+                                    startrow += len(df)
+                                # Si está vacío, solo suma la fila de debug si corresponde (ya lo hicimos)
+
+                    st.session_state.report_excel = output.getvalue()
+                    st.session_state.report_ready = True
+                    st.session_state.report_errors = errores
+                else:
+                    st.warning("No se generó ningún resultado para el reporte.")
 
         if st.session_state.get('report_ready', False) and st.session_state.get('report_excel', None):
             st.success("¡El reporte esta listo para descargar!")
